@@ -1,0 +1,248 @@
+#!/usr/bin/python3
+"""Assuan proxy wrapper around pinentry setting context-aware window titles."""
+
+from __future__ import annotations
+
+import configparser
+import os
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+from typing import Any
+
+
+def _sanitize_assuan_text(value: str) -> str:
+    """Strip control characters and newlines to prevent Assuan command injection."""
+    cleaned = "".join(ch if ord(ch) >= 32 and ch not in "\r\n" else " " for ch in value)
+    return " ".join(cleaned.split()).strip()
+
+
+def _split_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def load_config() -> dict[str, Any]:
+    """Load optional pinentry label settings from labels.conf."""
+    cfg: dict[str, Any] = {
+        "card_serial": "",
+        "card_label": "JavaCard",
+        "master_key_ids": [],
+        "fallback_key_ids": [],
+        "fallback_label": "Fallback Key",
+        "backend": "",
+        "qt_scale_factor": "1.25",
+    }
+    conf_env = os.environ.get("JAVACARD_LABELS_CONF", "").strip()
+    conf_path = (
+        Path(conf_env).expanduser()
+        if conf_env
+        else Path.home() / ".config" / "javacard-auth" / "labels.conf"
+    )
+    if not conf_path.is_file():
+        return cfg
+
+    raw_text = conf_path.read_text(encoding="utf-8", errors="replace")
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(raw_text)
+    except configparser.MissingSectionHeaderError:
+        parser.read_string("[labels]\n" + raw_text)
+    except configparser.Error:
+        return cfg
+
+    merged: dict[str, str] = {}
+    for section in parser.sections():
+        for k, v in parser.items(section):
+            merged[k.lower().strip()] = v.strip()
+
+    if "card_serial" in merged:
+        cfg["card_serial"] = merged["card_serial"]
+    if merged.get("card_label"):
+        cfg["card_label"] = merged["card_label"]
+    if "master_key_ids" in merged:
+        cfg["master_key_ids"] = _split_csv(merged["master_key_ids"])
+    if "fallback_key_ids" in merged:
+        cfg["fallback_key_ids"] = _split_csv(merged["fallback_key_ids"])
+    if merged.get("fallback_label"):
+        cfg["fallback_label"] = merged["fallback_label"]
+    if "backend" in merged:
+        cfg["backend"] = merged["backend"]
+    if "qt_scale_factor" in merged:
+        cfg["qt_scale_factor"] = merged["qt_scale_factor"]
+    return cfg
+
+
+def resolve_backend(cfg: dict[str, Any]) -> str | None:
+    """Resolve an executable pinentry backend while guarding against self-recursion."""
+    self_real = os.path.realpath(__file__)
+    candidates: list[str] = []
+
+    env_bin = os.environ.get("JAVACARD_PINENTRY_BIN", "").strip()
+    if env_bin:
+        candidates.append(env_bin)
+    if cfg.get("backend"):
+        candidates.append(str(cfg["backend"]))
+
+    has_display = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+    is_gtk_desktop = any(
+        tok in desktop for tok in ("gnome", "ubuntu", "unity", "cinnamon", "mate", "xfce")
+    )
+
+    if not has_display:
+        candidates.extend(
+            [
+                "/usr/bin/pinentry-curses",
+                "/usr/bin/pinentry-tty",
+                "/usr/bin/pinentry",
+            ]
+        )
+    elif is_gtk_desktop:
+        candidates.extend(
+            [
+                "/usr/bin/pinentry-gnome3",
+                "/usr/bin/pinentry-gtk-2",
+                "/usr/bin/pinentry-qt",
+                "/usr/bin/pinentry-curses",
+                "/usr/bin/pinentry-tty",
+                "/usr/bin/pinentry",
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                "/usr/bin/pinentry-qt",
+                "/usr/bin/pinentry-gnome3",
+                "/usr/bin/pinentry-gtk-2",
+                "/usr/bin/pinentry-curses",
+                "/usr/bin/pinentry-tty",
+                "/usr/bin/pinentry",
+            ]
+        )
+
+    for candidate in candidates:
+        expanded = os.path.expanduser(candidate)
+        if not os.path.isfile(expanded) or not os.access(expanded, os.X_OK):
+            continue
+        if os.path.realpath(expanded) == self_real:
+            continue
+        return expanded
+    return None
+
+
+def classify_title(raw_desc: str, cfg: dict[str, Any]) -> str:
+    """Classify pinentry prompt title from percent-decoded SETDESC description."""
+    desc = urllib.parse.unquote(raw_desc)
+    desc_lower = desc.lower()
+
+    card_label = _sanitize_assuan_text(str(cfg.get("card_label") or "JavaCard"))
+    card_serial = _sanitize_assuan_text(str(cfg.get("card_serial") or ""))
+    card_tag = f"{card_label} {card_serial}".strip() if card_serial else card_label
+
+    if "confirm" in desc_lower:
+        return _sanitize_assuan_text(f"[CONFIRM AUTH] {card_tag}")
+    if "admin pin" in desc_lower:
+        return _sanitize_assuan_text(f"[ADMIN PIN] {card_tag}")
+    if "pin" in desc_lower or (card_serial and card_serial.lower() in desc_lower):
+        return _sanitize_assuan_text(f"[USER PIN] {card_tag}")
+
+    for kid in cfg.get("master_key_ids", []):
+        clean_kid = _sanitize_assuan_text(kid)
+        if clean_kid and clean_kid.lower() in desc_lower:
+            return _sanitize_assuan_text(f"[MASTER KEY] {clean_kid}")
+
+    fallback_label = _sanitize_assuan_text(str(cfg.get("fallback_label") or "Fallback Key"))
+    for kid in cfg.get("fallback_key_ids", []):
+        clean_kid = _sanitize_assuan_text(kid)
+        if clean_kid and clean_kid.lower() in desc_lower:
+            return _sanitize_assuan_text(f"[FALLBACK KEY] {fallback_label}")
+
+    return "[PASSPHRASE]"
+
+
+def relay_response(proc: subprocess.Popen[str], forward: bool = True) -> bool:
+    """Forward backend Assuan lines until OK/ERR or EOF. Returns False on EOF."""
+    if proc.stdout is None:
+        return False
+    while True:
+        resp = proc.stdout.readline()
+        if not resp:
+            return False
+        if forward:
+            sys.stdout.write(resp)
+            sys.stdout.flush()
+        if resp.startswith(("OK", "ERR")):
+            return True
+
+
+def main() -> int:
+    cfg = load_config()
+    if "--check-backend" in sys.argv[1:]:
+        backend = resolve_backend(cfg)
+        if not backend:
+            sys.stderr.write("No pinentry backend found\n")
+            return 1
+        sys.stdout.write(f"{backend}\n")
+        return 0
+
+    backend = resolve_backend(cfg)
+    if not backend:
+        sys.stdout.write("ERR 83886179 No pinentry backend found\n")
+        sys.stdout.flush()
+        return 1
+
+    env = os.environ.copy()
+    if os.path.basename(backend) == "pinentry-qt" and cfg.get("qt_scale_factor"):
+        env.setdefault("QT_SCALE_FACTOR", str(cfg["qt_scale_factor"]))
+
+    proc = subprocess.Popen(
+        [backend, *sys.argv[1:]],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    if proc.stdin is None or proc.stdout is None:
+        return 1
+
+    try:
+        greeting = proc.stdout.readline()
+        if not greeting:
+            return proc.wait() or 1
+        sys.stdout.write(greeting)
+        sys.stdout.flush()
+
+        for line in sys.stdin:
+            if line.startswith("SETTITLE "):
+                sys.stdout.write("OK\n")
+                sys.stdout.flush()
+                continue
+
+            proc.stdin.write(line)
+            proc.stdin.flush()
+            if not relay_response(proc, forward=True):
+                break
+
+            if line.startswith("SETDESC "):
+                title = classify_title(line[8:], cfg)
+                proc.stdin.write(f"SETTITLE {title}\n")
+                proc.stdin.flush()
+                if not relay_response(proc, forward=False):
+                    break
+
+            if line.strip() == "BYE":
+                break
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+    return proc.wait()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

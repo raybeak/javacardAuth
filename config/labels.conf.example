@@ -1,0 +1,11 @@
+# Copy to ~/.config/javacard-auth/labels.conf and customize for your card/keys.
+[labels]
+card_serial = YOUR_CARD_SERIAL
+card_label = JavaCard
+master_key_ids = YOUR_MASTER_KEY_ID
+fallback_key_ids = YOUR_FALLBACK_KEY_ID
+fallback_label = Fallback Key
+
+# Optional explicit pinentry binary override (leave empty for auto-detection)
+backend =
+qt_scale_factor = 1.25

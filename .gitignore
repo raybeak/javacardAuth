@@ -1,0 +1,27 @@
+# Environment secrets & plaintext keys
+.env
+.env.*
+!.env.example
+
+# Cryptographic artifacts, keys, and applets
+*.gpg
+*.asc
+*.rev
+*.key
+*.cap
+.gnupg/
+
+# Host-specific generated or local config
+labels.conf
+gpg-recipients
+authorized_keys
+sshcontrol
+
+# Python / editor / backup clutter
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.orig
+*.swp
+.DS_Store

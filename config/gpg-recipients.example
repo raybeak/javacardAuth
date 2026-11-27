@@ -1,0 +1,5 @@
+# Copy to ~/.config/javacard-auth/gpg-recipients
+# Add one OpenPGP Key ID or Fingerprint per line (card key + offline/software fallback key).
+# Lines starting with '#' are ignored by envlock.
+# YOUR_CARD_KEY_ID
+# YOUR_FALLBACK_KEY_ID
